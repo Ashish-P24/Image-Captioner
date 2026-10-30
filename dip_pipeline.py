@@ -8,6 +8,8 @@ import cv2
 import numpy as np
 from PIL import Image
 import torch
+import matplotlib.pyplot as plt
+import io
 
 
 def compute_dip_metrics(image_np: np.ndarray) -> dict:
@@ -69,11 +71,11 @@ def compute_dip_metrics(image_np: np.ndarray) -> dict:
 
 def apply_dip_transformations(image_np: np.ndarray) -> dict:
     """
-    Applies fundamental DIP transformations to demonstrate image operations:
+    Applies fundamental DIP transformations:
     - Grayscale conversion
     - Histogram Equalization
     - CLAHE (Contrast Limited Adaptive Histogram Equalization)
-    - Sobel Edge Detection (Gx, Gy, Magnitude)
+    - Sobel Gradients (Gx, Gy, Magnitude)
     - Canny Edge Detection
     - Laplacian Second Derivative
     """
@@ -86,7 +88,7 @@ def apply_dip_transformations(image_np: np.ndarray) -> dict:
     hist_eq = cv2.equalizeHist(gray)
 
     # CLAHE
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
     clahe_img = clahe.apply(gray)
 
     # Sobel Gradients
@@ -114,8 +116,8 @@ def apply_dip_transformations(image_np: np.ndarray) -> dict:
 
 def extract_vit_attention_map(model, processor, image: Image.Image) -> np.ndarray:
     """
-    Extracts spatial self-attention from the Vision Transformer (ViT) backbone
-    of the vision-language model. Computes CLS-token attention to visual patches.
+    Extracts spatial self-attention from the Vision Transformer (ViT) backbone.
+    Computes CLS-token attention to visual patches across the deep layers.
     """
     inputs = processor(images=image, return_tensors="pt")
     pixel_values = inputs.pixel_values
@@ -134,9 +136,7 @@ def extract_vit_attention_map(model, processor, image: Image.Image) -> np.ndarra
     last_layers = attentions[-3:]
     layer_attns = []
     for layer in last_layers:
-        # layer shape: (1, num_heads, 577, 577)
         heads_mean = layer[0].mean(dim=0) # (577, 577)
-        # Attention from CLS token (index 0) to all patch tokens (index 1:)
         cls_to_patches = heads_mean[0, 1:] # (576,)
         layer_attns.append(cls_to_patches)
 
@@ -172,3 +172,78 @@ def generate_heatmap_overlay(
 
     overlay = cv2.addWeighted(image_np, 1.0 - alpha, colored_heatmap, alpha, 0)
     return overlay
+
+
+def generate_roi_bounding_boxes(
+    image_np: np.ndarray,
+    heatmap: np.ndarray,
+    threshold: float = 0.55,
+) -> np.ndarray:
+    """
+    Extracts high-salience attention clusters and draws glowing bounding boxes (ROI)
+    around primary semantic visual focal points.
+    """
+    annotated = image_np.copy()
+    mask = np.uint8((heatmap >= threshold) * 255)
+    
+    # Morphological closing to join fragmented attention blobs
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    mask_closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(mask_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    box_count = 0
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area > (image_np.shape[0] * image_np.shape[1] * 0.01): # At least 1% of image
+            x, y, w, h = cv2.boundingRect(cnt)
+            # Draw outer glow and inner box
+            cv2.rectangle(annotated, (x - 2, y - 2), (x + w + 2, y + h + 2), (0, 242, 254), 2)
+            cv2.rectangle(annotated, (x, y), (x + w, y + h), (56, 189, 248), 2)
+            box_count += 1
+            cv2.putText(
+                annotated,
+                f"ROI #{box_count}",
+                (x, max(24, y - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 242, 254),
+                2,
+                cv2.LINE_AA,
+            )
+
+    return annotated
+
+
+def render_dip_histogram(image_np: np.ndarray) -> np.ndarray:
+    """
+    Generates an aesthetic dark-themed RGB + Luminance histogram plot.
+    """
+    fig, ax = plt.subplots(figsize=(8, 3.2), facecolor="#090d16")
+    ax.set_facecolor("#0f172a")
+
+    if len(image_np.shape) == 3:
+        colors = [("#ef4444", "Red Channel"), ("#22c55e", "Green Channel"), ("#3b82f6", "Blue Channel")]
+        for idx, (col, label) in enumerate(colors):
+            hist = cv2.calcHist([image_np], [idx], None, [256], [0, 256])
+            ax.plot(hist, color=col, linewidth=1.5, alpha=0.85, label=label)
+
+    gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY) if len(image_np.shape) == 3 else image_np
+    hist_gray = cv2.calcHist([gray], [0], None, [256], [0, 256])
+    ax.plot(hist_gray, color="#e2e8f0", linewidth=2.0, linestyle="--", alpha=0.9, label="Luminance (Gray)")
+
+    ax.set_xlim([0, 256])
+    ax.set_xlabel("Pixel Intensity (0 - 255)", color="#94a3b8", fontsize=9)
+    ax.set_ylabel("Pixel Frequency", color="#94a3b8", fontsize=9)
+    ax.tick_params(colors="#64748b", labelsize=8)
+    for spine in ax.spines.values():
+        spine.set_color("#334155")
+    ax.legend(facecolor="#1e293b", edgecolor="#334155", labelcolor="#e2e8f0", fontsize=8)
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=140, facecolor=fig.get_facecolor(), edgecolor="none")
+    plt.close(fig)
+    buf.seek(0)
+    hist_plot = Image.open(buf)
+    return np.array(hist_plot)
