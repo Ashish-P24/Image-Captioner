@@ -218,7 +218,6 @@ def consistency_score(scored):
 
 
 def main():
-    st.set_page_config(layout="wide")
     st.title("Image Caption Generator")
 
     model_path = "image caption model/models/model.keras"

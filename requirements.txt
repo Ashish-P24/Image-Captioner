@@ -1,0 +1,8 @@
+streamlit
+tensorflow
+torch
+transformers
+opencv-python
+pillow
+matplotlib
+nltk
