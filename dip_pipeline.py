@@ -1,15 +1,17 @@
 """
 Digital Image Processing (DIP) Pipeline
 Contains image transformation, edge detection, contrast enhancement,
-DIP statistical metrics, and spatial attention heatmap generation.
+DIP statistical metrics, Grad-CAM spatial heatmaps, and spectral saliency.
 """
 
 import cv2
 import numpy as np
 from PIL import Image
 import torch
+import tensorflow as tf
 import matplotlib.pyplot as plt
 import io
+import streamlit as st
 
 
 def compute_dip_metrics(image_np: np.ndarray) -> dict:
@@ -114,10 +116,56 @@ def apply_dip_transformations(image_np: np.ndarray) -> dict:
     }
 
 
+@st.cache_resource(show_spinner=False)
+def load_gradcam_model():
+    """
+    Loads pretrained convolutional feature extractor for Grad-CAM spatial localization.
+    """
+    base_model = tf.keras.applications.MobileNetV2(weights="imagenet", include_top=True)
+    last_conv_layer_name = "Conv_1"
+    grad_model = tf.keras.models.Model(
+        inputs=[base_model.inputs],
+        outputs=[base_model.get_layer(last_conv_layer_name).output, base_model.output],
+    )
+    return grad_model
+
+
+def generate_gradcam_heatmap(image: Image.Image) -> np.ndarray:
+    """
+    Computes Gradient-weighted Class Activation Mapping (Grad-CAM)
+    highlighting the primary semantic object that drives visual recognition.
+    """
+    grad_model = load_gradcam_model()
+    orig_w, orig_h = image.size
+    
+    img_resized = image.convert("RGB").resize((224, 224))
+    img_array = np.expand_dims(np.array(img_resized, dtype=np.float32), axis=0)
+    img_preprocessed = tf.keras.applications.mobilenet_v2.preprocess_input(img_array)
+
+    with tf.GradientTape() as tape:
+        conv_outputs, predictions = grad_model(img_preprocessed)
+        pred_index = tf.argmax(predictions[0])
+        loss = predictions[:, pred_index]
+
+    grads = tape.gradient(loss, conv_outputs)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+    conv_outputs = conv_outputs[0]
+
+    cam = conv_outputs @ pooled_grads[..., tf.newaxis]
+    cam = tf.squeeze(cam)
+    cam = tf.maximum(cam, 0)
+    cam = cam / (tf.math.reduce_max(cam) + 1e-8)
+    cam_np = cam.numpy()
+
+    # Interpolate to match original image dimensions
+    heatmap_resized = cv2.resize(cam_np, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
+    heatmap_resized = np.clip(heatmap_resized, 0.0, 1.0)
+    return heatmap_resized
+
+
 def extract_vit_attention_map(model, processor, image: Image.Image) -> np.ndarray:
     """
     Extracts spatial self-attention from the Vision Transformer (ViT) backbone.
-    Computes CLS-token attention to visual patches across the deep layers.
     """
     inputs = processor(images=image, return_tensors="pt")
     pixel_values = inputs.pixel_values
@@ -129,44 +177,68 @@ def extract_vit_attention_map(model, processor, image: Image.Image) -> np.ndarra
             return_dict=True,
         )
 
-    # attentions: tuple of (batch_size, num_heads, seq_len, seq_len)
     attentions = vision_outputs.attentions
     
-    # Aggregate attention across the last 3 transformer layers
-    last_layers = attentions[-3:]
+    # Average across middle-to-late transformer layers
+    target_layers = attentions[4:10]
     layer_attns = []
-    for layer in last_layers:
+    for layer in target_layers:
         heads_mean = layer[0].mean(dim=0) # (577, 577)
         cls_to_patches = heads_mean[0, 1:] # (576,)
         layer_attns.append(cls_to_patches)
 
     avg_attn = torch.stack(layer_attns).mean(dim=0).detach().cpu().numpy()
-    
-    # 24x24 patch grid
     grid_size = int(np.sqrt(avg_attn.shape[0]))
     attn_grid = avg_attn.reshape(grid_size, grid_size)
 
-    # Min-max normalization
     attn_normalized = (attn_grid - attn_grid.min()) / (attn_grid.max() - attn_grid.min() + 1e-8)
-
-    # Interpolate to match original image dimensions using Bicubic interpolation
     w, h = image.size
     heatmap_resized = cv2.resize(attn_normalized, (w, h), interpolation=cv2.INTER_CUBIC)
     heatmap_resized = np.clip(heatmap_resized, 0.0, 1.0)
-
     return heatmap_resized
+
+
+def generate_spectral_saliency_heatmap(image_np: np.ndarray) -> np.ndarray:
+    """
+    Classical DIP Frequency-Domain Saliency via Fourier Spectral Residual (Hou & Zhang).
+    """
+    if len(image_np.shape) == 3:
+        gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = image_np
+
+    orig_h, orig_w = gray.shape
+    scale = 256
+    gray_small = cv2.resize(gray, (scale, scale)).astype(np.float32)
+
+    fft = np.fft.fft2(gray_small)
+    amplitude = np.abs(fft)
+    log_amplitude = np.log(amplitude + 1e-6)
+    phase = np.angle(fft)
+
+    spectral_residual = log_amplitude - cv2.boxFilter(log_amplitude, -1, (7, 7))
+    combined = np.exp(spectral_residual + 1j * phase)
+    ifft = np.fft.ifft2(combined)
+    saliency = np.abs(ifft) ** 2
+    saliency = cv2.GaussianBlur(saliency, (9, 9), 2.5)
+
+    saliency_full = cv2.resize(saliency, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
+    saliency_norm = (saliency_full - saliency_full.min()) / (saliency_full.max() - saliency_full.min() + 1e-8)
+    return np.clip(saliency_norm, 0.0, 1.0)
 
 
 def generate_heatmap_overlay(
     image_np: np.ndarray,
     heatmap: np.ndarray,
     colormap_type: int = cv2.COLORMAP_JET,
-    alpha: float = 0.5,
+    alpha: float = 0.55,
 ) -> np.ndarray:
     """
     Overlays spatial attention heatmap on top of the original RGB image.
     """
-    heatmap_uint8 = np.uint8(255 * heatmap)
+    # Normalize to [0, 255]
+    norm_heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+    heatmap_uint8 = np.uint8(255 * norm_heatmap)
     colored_heatmap = cv2.applyColorMap(heatmap_uint8, colormap_type)
     colored_heatmap = cv2.cvtColor(colored_heatmap, cv2.COLOR_BGR2RGB)
 
@@ -177,40 +249,49 @@ def generate_heatmap_overlay(
 def generate_roi_bounding_boxes(
     image_np: np.ndarray,
     heatmap: np.ndarray,
-    threshold: float = 0.55,
+    threshold: float = 0.60,
 ) -> np.ndarray:
     """
     Extracts high-salience attention clusters and draws glowing bounding boxes (ROI)
     around primary semantic visual focal points.
     """
     annotated = image_np.copy()
-    mask = np.uint8((heatmap >= threshold) * 255)
+    norm_heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+    mask = np.uint8((norm_heatmap >= threshold) * 255)
     
-    # Morphological closing to join fragmented attention blobs
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    # Morphological closing & dilation to consolidate detection regions
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 21))
     mask_closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask_dilated = cv2.dilate(mask_closed, kernel, iterations=1)
 
-    contours, _ = cv2.findContours(mask_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(mask_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     box_count = 0
+    img_area = image_np.shape[0] * image_np.shape[1]
+    
+    # Sort contours by area descending
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area > (image_np.shape[0] * image_np.shape[1] * 0.01): # At least 1% of image
+        if area > (img_area * 0.02):  # At least 2% of image
             x, y, w, h = cv2.boundingRect(cnt)
-            # Draw outer glow and inner box
+            box_count += 1
+            # Draw double border for high-tech highlight
             cv2.rectangle(annotated, (x - 2, y - 2), (x + w + 2, y + h + 2), (0, 242, 254), 2)
             cv2.rectangle(annotated, (x, y), (x + w, y + h), (56, 189, 248), 2)
-            box_count += 1
             cv2.putText(
                 annotated,
                 f"ROI #{box_count}",
                 (x, max(24, y - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
+                0.65,
                 (0, 242, 254),
                 2,
                 cv2.LINE_AA,
             )
+            if box_count >= 3:
+                break
 
     return annotated
 
